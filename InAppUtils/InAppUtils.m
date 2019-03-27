@@ -19,10 +19,6 @@
     return self;
 }
 
-+ (BOOL)requiresMainQueueSetup {
-    return NO;
-}
-
 - (dispatch_queue_t)methodQueue
 {
     return dispatch_get_main_queue();
@@ -51,7 +47,12 @@ RCT_EXPORT_MODULE()
                 NSString *key = RCTKeyForInstance(transaction.payment.productIdentifier);
                 RCTResponseSenderBlock callback = _callbacks[key];
                 if (callback) {
-                    NSDictionary *purchase = [self getPurchaseData:transaction];
+                    NSDictionary *purchase = @{
+                                              @"transactionDate": @(transaction.transactionDate.timeIntervalSince1970 * 1000),
+                                              @"transactionIdentifier": transaction.transactionIdentifier,
+                                              @"productIdentifier": transaction.payment.productIdentifier,
+                                              @"transactionReceipt": [[transaction transactionReceipt] base64EncodedStringWithOptions:0]
+                                              };
                     callback(@[[NSNull null], purchase]);
                     [_callbacks removeObjectForKey:key];
                 } else {
@@ -75,22 +76,8 @@ RCT_EXPORT_MODULE()
     }
 }
 
-RCT_EXPORT_METHOD(purchaseProductForUser:(NSString *)productIdentifier
-                  username:(NSString *)username
-                  callback:(RCTResponseSenderBlock)callback)
-{
-    [self doPurchaseProduct:productIdentifier username:username callback:callback];
-}
-
 RCT_EXPORT_METHOD(purchaseProduct:(NSString *)productIdentifier
                   callback:(RCTResponseSenderBlock)callback)
-{
-    [self doPurchaseProduct:productIdentifier username:nil callback:callback];
-}
-
-- (void) doPurchaseProduct:(NSString *)productIdentifier
-                  username:(NSString *)username
-                  callback:(RCTResponseSenderBlock)callback
 {
     SKProduct *product;
     for(SKProduct *p in products)
@@ -102,10 +89,7 @@ RCT_EXPORT_METHOD(purchaseProduct:(NSString *)productIdentifier
     }
 
     if(product) {
-        SKMutablePayment *payment = [SKMutablePayment paymentWithProduct:product];
-        if(username) {
-            payment.applicationUsername = username;
-        }
+        SKPayment *payment = [SKPayment paymentWithProduct:product];
         [[SKPaymentQueue defaultQueue] addPayment:payment];
         _callbacks[RCTKeyForInstance(payment.productIdentifier)] = callback;
     } else {
@@ -128,7 +112,7 @@ restoreCompletedTransactionsFailedWithError:(NSError *)error
                 callback(@[@"restore_failed"]);
                 break;
         }
-
+        
         [_callbacks removeObjectForKey:key];
     } else {
         RCTLogWarn(@"No callback registered for restore product request.");
@@ -144,7 +128,18 @@ restoreCompletedTransactionsFailedWithError:(NSError *)error
         for(SKPaymentTransaction *transaction in queue.transactions){
             if(transaction.transactionState == SKPaymentTransactionStateRestored) {
 
-                NSDictionary *purchase = [self getPurchaseData:transaction];
+                NSMutableDictionary *purchase = [NSMutableDictionary dictionaryWithDictionary: @{
+                    @"transactionDate": @(transaction.transactionDate.timeIntervalSince1970 * 1000),
+                    @"transactionIdentifier": transaction.transactionIdentifier,
+                    @"productIdentifier": transaction.payment.productIdentifier,
+                    @"transactionReceipt": [[transaction transactionReceipt] base64EncodedStringWithOptions:0]
+                }];
+
+                SKPaymentTransaction *originalTransaction = transaction.originalTransaction;
+                if (originalTransaction) {
+                    purchase[@"originalTransactionDate"] = @(originalTransaction.transactionDate.timeIntervalSince1970 * 1000);
+                    purchase[@"originalTransactionIdentifier"] = originalTransaction.transactionIdentifier;
+                }
 
                 [productsArrayForJS addObject:purchase];
                 [[SKPaymentQueue defaultQueue] finishTransaction:transaction];
@@ -157,35 +152,6 @@ restoreCompletedTransactionsFailedWithError:(NSError *)error
     }
 }
 
-RCT_EXPORT_METHOD(refreshReceipt:(BOOL)testExpired
-                  testRevoked:(BOOL)testRevoked
-                  callback:(RCTResponseSenderBlock)callback)
-{
-    SKReceiptRefreshRequest *refreshRequest;
-    if (testExpired || testRevoked) {
-        NSDictionary *properties = @{
-                                     SKReceiptPropertyIsExpired:@(testExpired),
-                                     SKReceiptPropertyIsRevoked:@(testRevoked)
-                                     };
-        refreshRequest = [[SKReceiptRefreshRequest alloc] initWithReceiptProperties:properties];
-    } else {
-        refreshRequest = [[SKReceiptRefreshRequest alloc] init];
-    }
-    refreshRequest.delegate = self;
-    _callbacks[RCTKeyForInstance(refreshRequest)] = callback;
-    [refreshRequest start];
-}
-
-- (void)requestDidFinish:(SKRequest *)request
-{
-    NSString *key = RCTKeyForInstance(request);
-    RCTResponseSenderBlock callback = _callbacks[key];
-    if (callback) {
-        callback(@[[NSNull null], @"finished"]);
-        [_callbacks removeObjectForKey:key];
-    }
-}
-
 RCT_EXPORT_METHOD(restorePurchases:(RCTResponseSenderBlock)callback)
 {
     NSString *restoreRequest = @"restoreRequest";
@@ -193,26 +159,18 @@ RCT_EXPORT_METHOD(restorePurchases:(RCTResponseSenderBlock)callback)
     [[SKPaymentQueue defaultQueue] restoreCompletedTransactions];
 }
 
-RCT_EXPORT_METHOD(restorePurchasesForUser:(NSString *)username
-                    callback:(RCTResponseSenderBlock)callback)
-{
-    NSString *restoreRequest = @"restoreRequest";
-    _callbacks[RCTKeyForInstance(restoreRequest)] = callback;
-    if(!username) {
-        callback(@[@"username_required"]);
-        return;
-    }
-    [[SKPaymentQueue defaultQueue] restoreCompletedTransactionsWithApplicationUsername:username];
-}
-
 RCT_EXPORT_METHOD(loadProducts:(NSArray *)productIdentifiers
                   callback:(RCTResponseSenderBlock)callback)
 {
-    SKProductsRequest *productsRequest = [[SKProductsRequest alloc]
-                                          initWithProductIdentifiers:[NSSet setWithArray:productIdentifiers]];
-    productsRequest.delegate = self;
-    _callbacks[RCTKeyForInstance(productsRequest)] = callback;
-    [productsRequest start];
+    if([SKPaymentQueue canMakePayments]){
+        SKProductsRequest *productsRequest = [[SKProductsRequest alloc]
+                                              initWithProductIdentifiers:[NSSet setWithArray:productIdentifiers]];
+        productsRequest.delegate = self;
+        _callbacks[RCTKeyForInstance(productsRequest)] = callback;
+        [productsRequest start];
+    } else {
+        callback(@[@"not_available"]);
+    }
 }
 
 RCT_EXPORT_METHOD(canMakePayments: (RCTResponseSenderBlock)callback)
@@ -232,7 +190,52 @@ RCT_EXPORT_METHOD(receiptData:(RCTResponseSenderBlock)callback)
     }
 }
 
+RCT_EXPORT_METHOD(refreshReceipt:(RCTResponseSenderBlock)callback)
+{
+    [self refreshReceipt:callback testExpired:NO testRevoked:NO];
+}
+
+RCT_EXPORT_METHOD(testRefreshExpiredReceipt:(RCTResponseSenderBlock)callback)
+{
+    [self refreshReceipt:callback testExpired:YES testRevoked:NO];
+}
+
+RCT_EXPORT_METHOD(testRefreshRevokeReceipt:(RCTResponseSenderBlock)callback)
+{
+    [self refreshReceipt:callback testExpired:NO testRevoked:YES];
+}
+
+- (void)refreshReceipt:(RCTResponseSenderBlock)callback
+           testExpired:(BOOL)testExpired
+           testRevoked:(BOOL)testRevoked
+{
+    SKReceiptRefreshRequest *refreshRequest;
+    if (testExpired || testRevoked) {
+        NSDictionary *properties = @{
+                                     SKReceiptPropertyIsExpired:@(testExpired),
+                                     SKReceiptPropertyIsRevoked:@(testRevoked)
+                                     };
+        refreshRequest = [[SKReceiptRefreshRequest alloc] initWithReceiptProperties:properties];
+    } else {
+        refreshRequest = [[SKReceiptRefreshRequest alloc] init];
+    }
+    refreshRequest.delegate = self;
+    _callbacks[RCTKeyForInstance(refreshRequest)] = callback;
+    [refreshRequest start];
+}
+
 // SKProductsRequestDelegate protocol method
+
+- (void)requestDidFinish:(SKRequest *)request
+{
+    NSString *key = RCTKeyForInstance(request);
+    RCTResponseSenderBlock callback = _callbacks[key];
+    if (callback) {
+        callback(@[[NSNull null], @"finished"]);
+        [_callbacks removeObjectForKey:key];
+    }
+}
+
 - (void)productsRequest:(SKProductsRequest *)request
      didReceiveResponse:(SKProductsResponse *)response
 {
@@ -248,7 +251,6 @@ RCT_EXPORT_METHOD(receiptData:(RCTResponseSenderBlock)callback)
                                       @"currencySymbol": [item.priceLocale objectForKey:NSLocaleCurrencySymbol],
                                       @"currencyCode": [item.priceLocale objectForKey:NSLocaleCurrencyCode],
                                       @"priceString": item.priceString,
-                                      @"countryCode": [item.priceLocale objectForKey: NSLocaleCountryCode],
                                       @"downloadable": item.downloadable ? @"true" : @"false" ,
                                       @"description": item.localizedDescription ? item.localizedDescription : @"",
                                       @"title": item.localizedTitle ? item.localizedTitle : @"",
@@ -270,23 +272,6 @@ RCT_EXPORT_METHOD(receiptData:(RCTResponseSenderBlock)callback)
         callback(@[RCTJSErrorFromNSError(error)]);
         [_callbacks removeObjectForKey:key];
     }
-}
-
-- (NSDictionary *)getPurchaseData:(SKPaymentTransaction *)transaction {
-    NSMutableDictionary *purchase = [NSMutableDictionary dictionaryWithDictionary: @{
-                                                                                     @"transactionDate": @(transaction.transactionDate.timeIntervalSince1970 * 1000),
-                                                                                     @"transactionIdentifier": transaction.transactionIdentifier,
-                                                                                     @"productIdentifier": transaction.payment.productIdentifier,
-                                                                                     @"transactionReceipt": [[transaction transactionReceipt] base64EncodedStringWithOptions:0]
-                                                                                     }];
-    // originalTransaction is available for restore purchase and purchase of cancelled/expired subscriptions
-    SKPaymentTransaction *originalTransaction = transaction.originalTransaction;
-    if (originalTransaction) {
-        purchase[@"originalTransactionDate"] = @(originalTransaction.transactionDate.timeIntervalSince1970 * 1000);
-        purchase[@"originalTransactionIdentifier"] = originalTransaction.transactionIdentifier;
-    }
-
-    return purchase;
 }
 
 - (void)dealloc
